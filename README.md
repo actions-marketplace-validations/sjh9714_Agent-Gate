@@ -283,8 +283,8 @@ pnpm format:check
 ```
 
 Every rule requires passing and failing fixtures, exact rule/severity/decision
-assertions, and a Markdown snapshot for user-facing findings. Start with the
-[contribution guide](CONTRIBUTING.md).
+assertions, and a Markdown snapshot for user-facing findings. Start with a
+[good first issue](https://github.com/sjh9714/mergewarden/labels/good%20first%20issue) — each names its file, verify command, and done criteria — or the [contribution guide](CONTRIBUTING.md).
 
 ## Documentation
 
