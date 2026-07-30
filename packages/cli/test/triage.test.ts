@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { parseTriageOptions, partitionUniformNotes, TriageUsageError } from "../src/triage.js";
@@ -90,5 +92,33 @@ describe("partitionUniformNotes", () => {
     const result = partitionUniformNotes(input);
 
     expect(result.uniform).toEqual([]);
+  });
+});
+
+describe("triage output formats", () => {
+  it("keeps the human and JSON views in agreement", () => {
+    // They diverged once: the uniform-note partition ran after the JSON branch returned, so a
+    // validation run that asked for JSON measured the behaviour the fix had already removed.
+    const source = readFileSync(new URL("../src/triage.ts", import.meta.url), "utf8");
+    const partitionAt = source.indexOf("const partitioned = partitionUniformNotes(rows)");
+    const jsonBranchAt = source.indexOf('if (options.format === "json")');
+
+    expect(partitionAt).toBeGreaterThan(-1);
+    expect(jsonBranchAt).toBeGreaterThan(-1);
+    expect(partitionAt).toBeLessThan(jsonBranchAt);
+  });
+});
+
+describe("triage automation reporting", () => {
+  it("distinguishes an automation queue from an empty result in the source", () => {
+    // A queue of ten dependabot bumps printed as "10 read, 0 flagged", which reads as the tool
+    // failing rather than as there being nothing here for a human. 14 of the 14 silent
+    // repositories in the validation run were exactly this.
+    const source = readFileSync(new URL("../src/triage.ts", import.meta.url), "utf8");
+
+    expect(source).toContain("are maintenance automation and were not read");
+    expect(source).toContain("Nothing here is waiting on a human");
+    // Excluded authors come from the analysed policy, not a second copy of the list.
+    expect(source).toContain("input.config.triage.exclude_authors");
   });
 });

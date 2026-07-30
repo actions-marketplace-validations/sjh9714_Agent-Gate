@@ -21,6 +21,7 @@ export interface TriageIo {
 const REPO = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
+const RETRYABLE = new Set([403, 429, 500, 502, 503, 504]);
 
 export class TriageUsageError extends Error {}
 
@@ -86,6 +87,7 @@ interface OpenPullRequest {
   number: number;
   title: string;
   headRef: string;
+  author: string;
 }
 
 async function listOpenPullRequests(
@@ -110,10 +112,26 @@ async function listOpenPullRequests(
     headers.authorization = `Bearer ${token}`;
   }
 
-  const response = await fetch(url, { headers });
+  // GitHub answers a burst of requests with 403 under its secondary rate limit, which is
+  // transient and unrelated to the hourly budget. The rest of the CLI retries through
+  // @mergewarden/github; this listing is a direct call and needs its own bounded backoff.
+  let response = await fetch(url, { headers });
+
+  for (let attempt = 1; attempt <= 3 && RETRYABLE.has(response.status); attempt++) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const waitMs =
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : attempt * 20_000;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    response = await fetch(url, { headers });
+  }
 
   if (!response.ok) {
-    throw new Error(`Could not list pull requests for ${owner}/${repo}: HTTP ${response.status}`);
+    const hint = RETRYABLE.has(response.status)
+      ? " — GitHub is rate limiting this token; try again in a few minutes"
+      : "";
+    throw new Error(
+      `Could not list pull requests for ${owner}/${repo}: HTTP ${response.status}${hint}`,
+    );
   }
 
   const payload = (await response.json()) as {
@@ -121,12 +139,14 @@ async function listOpenPullRequests(
     title: string;
     draft?: boolean;
     head?: { ref?: string };
+    user?: { login?: string };
   }[];
 
   return payload.slice(0, limit).map((pull) => ({
     number: pull.number,
     title: pull.title,
     headRef: pull.head?.ref ?? "",
+    author: pull.user?.login ?? "",
   }));
 }
 
@@ -264,7 +284,14 @@ export async function runTriageCli(
     return 2;
   }
 
-  const rows: { number: number; title: string; headRef: string; notes: string[] }[] = [];
+  const rows: {
+    number: number;
+    title: string;
+    headRef: string;
+    author: string;
+    notes: string[];
+  }[] = [];
+  const automation: OpenPullRequest[] = [];
 
   for (const pull of openPullRequests) {
     try {
@@ -277,6 +304,20 @@ export async function runTriageCli(
       // report. Here it earns its place: the question is which of many open pull requests to
       // read first, and comparing them on the same facts is the point.
       input.config.triage.no_linked_issue = "info";
+
+      // Maintenance automation is excluded from the rules, so it can never be flagged. Counting
+      // it as a read pull request that happened to be clean is what made a queue of ten
+      // dependabot bumps print as "10 read, 0 flagged" — a result that reads as the tool
+      // failing rather than as there being nothing for a human here.
+      if (
+        input.config.triage.exclude_authors.some(
+          (entry) => entry.toLowerCase() === pull.author.toLowerCase(),
+        )
+      ) {
+        automation.push(pull);
+        continue;
+      }
+
       const result = await analyze(input);
       rows.push({ ...pull, notes: notesFor(result) });
     } catch {
@@ -286,29 +327,46 @@ export async function runTriageCli(
     }
   }
 
+  // Applied before the format branch. The human and JSON views must not disagree about which
+  // notes rank a pull request — they did, and a validation run measured the unfixed behaviour
+  // because it asked for JSON.
+  const partitioned = partitionUniformNotes(rows) as { uniform: string[]; rows: typeof rows };
+
   if (options.format === "json") {
     io.stdout(
-      `${JSON.stringify({ repository: `${options.owner}/${options.repo}`, rows }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          repository: `${options.owner}/${options.repo}`,
+          uniformNotes: partitioned.uniform,
+          automationPullRequests: automation.length,
+          rows: partitioned.rows,
+        },
+        null,
+        2,
+      )}\n`,
     );
     return 0;
   }
 
   // Most signals first: the point of the command is which pull request to open next.
-  const partitioned = partitionUniformNotes(rows) as {
-    uniform: string[];
-    rows: typeof rows;
-  };
   const flagged = partitioned.rows
     .filter((row) => row.notes.length > 0)
     .sort((left, right) => right.notes.length - left.notes.length || left.number - right.number);
 
   if (rows.length === 0) {
-    io.stdout(`${options.owner}/${options.repo} has no open pull requests.\n`);
+    io.stdout(
+      automation.length > 0
+        ? `${options.owner}/${options.repo}: all ${automation.length} open pull request(s) read are maintenance automation. Nothing here is waiting on a human.\n`
+        : `${options.owner}/${options.repo} has no open pull requests.\n`,
+    );
     return 0;
   }
 
   const lines = [
     `${rows.length} open pull request(s) read. ${flagged.length} have something a maintainer checks by hand.`,
+    ...(automation.length > 0
+      ? [`${automation.length} more are maintenance automation and were not read.`]
+      : []),
     "",
   ];
 
