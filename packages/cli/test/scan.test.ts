@@ -7,6 +7,7 @@ import {
   type AnalysisInput,
 } from "@mergewarden/core";
 import {
+  FetchGitHubApi,
   GitHubApiError,
   loadGitHubAnalysis,
   type GitHubApi,
@@ -16,7 +17,6 @@ import {
   type RemotePullRequest,
 } from "@mergewarden/github";
 import { HELP_TEXT, runCli, type CliDependencies } from "../src/cli.js";
-import { NativeGitHubApi } from "../src/githubApi.js";
 import { MERGEWARDEN_VERSION } from "../src/version.js";
 
 function analysisInput(options: { blocked?: boolean; complete?: boolean } = {}): AnalysisInput {
@@ -128,6 +128,10 @@ describe("CLI scan", () => {
 
     expect(await runCli(["--help"], helpIo.value)).toBe(0);
     expect(helpIo.stdout.join("")).toBe(HELP_TEXT);
+    expect(HELP_TEXT.indexOf("mergewarden scan")).toBeLessThan(
+      HELP_TEXT.indexOf("mergewarden demo"),
+    );
+    expect(HELP_TEXT).toContain("See what deserves human review");
     expect(helpIo.stderr).toEqual([]);
     expect(await runCli(["--version"], versionIo.value)).toBe(0);
     expect(versionIo.stdout.join("")).toBe(`${MERGEWARDEN_VERSION}\n`);
@@ -264,7 +268,7 @@ describe("CLI scan", () => {
       now: () => "2026-07-10T00:00:00.000Z",
       analyze,
       loadGitHubAnalysis,
-      createGitHubApi: (token) => new NativeGitHubApi({ token, fetch }),
+      createGitHubApi: (token) => new FetchGitHubApi({ token, fetch }),
     });
 
     expect(exitCode).toBe(1);
