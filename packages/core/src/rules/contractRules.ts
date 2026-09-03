@@ -1,8 +1,13 @@
 import { scopePathsForFile } from "../path/scopePaths.js";
-import type { Finding, Severity } from "../types.js";
+import type { RawFinding, Severity } from "../types.js";
 import type { Rule, RuleContext } from "./types.js";
 
-function baseFinding(ruleId: string, severity: Severity, title: string, message: string): Finding {
+function baseFinding(
+  ruleId: string,
+  severity: Severity,
+  title: string,
+  message: string,
+): RawFinding {
   return {
     ruleId,
     severity,
@@ -37,11 +42,11 @@ export const contractInvalidRule: Rule = {
       "contract/invalid",
       "error",
       "Invalid agent contract",
-      "This PR contains an agent-gate contract, but it could not be parsed.",
+      "This PR contains a MergeWarden contract, but it could not be parsed.",
     );
 
     finding.evidence.push({ label: "parser_message", value: ctx.input.contract.message });
-    finding.remediation.push("Fix the agent-gate contract block in the PR body.");
+    finding.remediation.push("Fix the mergewarden contract block in the PR body.");
 
     return [finding];
   },
@@ -55,23 +60,24 @@ export const contractMissingRule: Rule = {
       return [];
     }
 
-    const severity =
-      ctx.input.config.mode === "observe" && ctx.input.config.contract.allow_missing_in_observe_mode
-        ? "warn"
-        : "error";
+    // `allow_missing_in_observe_mode` used to downgrade this to `warn` in observe mode. That
+    // only mattered when the default was `error`; now that the default is `info`, downgrading
+    // would mean *raising* the severity for a repository that had opted into `error`. The
+    // configured severity is used as written, in every mode.
+    const severity = ctx.input.config.contract.missing_severity;
 
     const finding = baseFinding(
       "contract/missing",
       severity,
       "Missing agent contract",
-      "Agent-generated PRs must include an agent-gate contract.",
+      "Agent-generated PRs must include a MergeWarden contract.",
     );
 
     finding.evidence.push({
       label: "required_for",
       value: ctx.input.config.contract.required_for.join(", "),
     });
-    finding.remediation.push("Add an agent-gate contract block to the PR body.");
+    finding.remediation.push("Add a MergeWarden contract block to the PR body.");
 
     return [finding];
   },

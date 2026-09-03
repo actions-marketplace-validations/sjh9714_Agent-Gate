@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  fetchRepositoryTextContent,
   runAction,
   type ActionContext,
   type ActionRuntime,
@@ -9,7 +8,7 @@ import {
   type PullFile,
 } from "../src/run.js";
 import { writeTextFile } from "../src/fileWriter.js";
-import { AGENT_GATE_VERSION } from "../src/version.js";
+import { MERGEWARDEN_VERSION } from "../src/version.js";
 
 const BASE_SHA = "base-sha";
 const HEAD_SHA = "head-sha";
@@ -28,9 +27,15 @@ function contentResponse(text: string) {
   };
 }
 
+function githubApiError(status: number, message: string) {
+  const error = new Error(message) as Error & { status: number };
+  error.status = status;
+  return error;
+}
+
 function validContractBody() {
   return [
-    "<!-- agent-gate-contract",
+    "<!-- mergewarden-contract",
     "version: 1",
     "agent: codex",
     "task: workflow hardening",
@@ -40,6 +45,36 @@ function validContractBody() {
   ].join("\n");
 }
 
+/**
+ * A pull request that is deliberately NOT agent-authored.
+ *
+ * Agent detection ships defaults, so a `codex/**` branch with no contract now correctly
+ * produces `contract/missing`. Tests that exercise content fetching or comment bounding
+ * rather than agent policy use this so the behaviour they assert is the one they mean.
+ */
+function humanPrContext(
+  overrides: Partial<ActionContext["payload"]["pull_request"]> = {},
+): ActionContext {
+  const base = prContext(overrides);
+  const pr = base.payload.pull_request;
+
+  if (!pr) {
+    return base;
+  }
+
+  return {
+    ...base,
+    payload: {
+      pull_request: {
+        ...pr,
+        user: { login: "octocat" },
+        labels: [],
+        head: { ...pr.head, ref: "demo/content-fetching" },
+      },
+    },
+  };
+}
+
 function prContext(
   overrides: Partial<ActionContext["payload"]["pull_request"]> = {},
 ): ActionContext {
@@ -47,13 +82,14 @@ function prContext(
     eventName: "pull_request",
     repo: {
       owner: "sjh9714",
-      repo: "Agent-Gate",
+      repo: "mergewarden",
     },
     payload: {
       pull_request: {
         number: 5,
         title: "Tighten workflow permissions",
         body: validContractBody(),
+        changed_files: 1,
         user: {
           login: "codex",
         },
@@ -97,31 +133,45 @@ interface IssueComment {
     login?: string | null;
     type?: string | null;
   } | null;
+  performed_via_github_app?: {
+    slug?: string | null;
+  } | null;
+}
+
+interface TestOctokit extends OctokitLike {
+  readonly changedFileCount: number;
 }
 
 function createOctokit(options: {
   files?: PullFile[];
   contents?: Record<string, string>;
-  errors?: Record<string, Error>;
+  rawContents?: Record<string, unknown>;
+  errors?: Record<string, unknown>;
   comments?: IssueComment[];
   commentErrors?: {
     list?: Error;
     create?: Error;
     update?: Error;
   };
-}): OctokitLike {
+}): TestOctokit {
   const files = options.files ?? [];
   const contents = options.contents ?? {};
+  const rawContents = options.rawContents ?? {};
   const errors = options.errors ?? {};
   const comments = options.comments ?? [];
   const commentErrors = options.commentErrors ?? {};
 
   const listFiles = vi.fn(async () => ({ data: files }));
+  const getPullRequest = vi.fn(async () => ({ data: { changed_files: files.length } }));
   const getContent = vi.fn(async ({ path, ref }: { path: string; ref: string }) => {
     const key = `${ref}:${path}`;
 
     if (errors[key]) {
       throw errors[key];
+    }
+
+    if (key in rawContents) {
+      return { data: rawContents[key] };
     }
 
     const content = contents[key];
@@ -156,12 +206,14 @@ function createOctokit(options: {
   });
 
   return {
+    changedFileCount: files.length,
     paginate: vi.fn(async (method, args) => {
       const response = await method(args);
       return response.data;
     }),
     rest: {
       pulls: {
+        get: getPullRequest,
         listFiles,
       },
       repos: {
@@ -184,12 +236,12 @@ function createHarness(
   } = {},
 ) {
   const inputs = {
-    config: "agent-gate.yml",
+    config: "mergewarden.yml",
     mode: "",
     comment: "false",
     "fail-on-block": "true",
-    "report-json": "agent-gate-report.json",
-    "report-markdown": "agent-gate-report.md",
+    "report-json": "mergewarden-report.json",
+    "report-markdown": "mergewarden-report.md",
     "github-token": "token",
     ...options.inputs,
   };
@@ -200,12 +252,17 @@ function createHarness(
   const warnings: string[] = [];
   const writtenFiles = new Map<string, string>();
   let summaryText = "";
+  const octokit = options.octokit ?? createOctokit({});
+  const changedFileCount =
+    "changedFileCount" in octokit && typeof octokit.changedFileCount === "number"
+      ? octokit.changedFileCount
+      : 0;
 
   const runtime = {
-    context: options.context ?? prContext(),
-    octokit: options.octokit ?? createOctokit({}),
+    context: options.context ?? prContext({ changed_files: changedFileCount }),
+    octokit,
     getInput: vi.fn((name: string) => inputs[name] ?? ""),
-    setOutput: vi.fn((name: string, value: string | number) => {
+    setOutput: vi.fn((name: string, value: string | number | boolean) => {
       outputs.set(name, String(value));
     }),
     setFailed: vi.fn((message: string | Error) => {
@@ -250,21 +307,21 @@ describe("runAction", () => {
     const harness = createHarness({
       context: {
         eventName: "push",
-        repo: { owner: "sjh9714", repo: "Agent-Gate" },
+        repo: { owner: "sjh9714", repo: "mergewarden" },
         payload: {},
       },
     });
 
     await runAction(harness.runtime);
 
-    expect(harness.failures).toEqual(["Agent Gate can only run on pull_request events."]);
+    expect(harness.failures).toEqual(["MergeWarden can only run on pull_request events."]);
   });
 
   it("builds analysis input from PR APIs, writes reports, and fails on block by default", async () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]:
+        [`${BASE_SHA}:mergewarden.yml`]:
           "version: 1\nmode: block\nagent_detection:\n  labels:\n    - ai\n",
         [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: read\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: [
@@ -289,38 +346,208 @@ describe("runAction", () => {
     expect(result?.findings.map((finding) => finding.ruleId)).not.toContain("contract/missing");
     expect(result?.findings.map((finding) => finding.ruleId)).not.toContain("contract/invalid");
     expect(harness.outputs.get("decision")).toBe("block");
+    expect(harness.outputs.get("status")).toBe("blocked");
+    expect(harness.outputs.get("analysis-complete")).toBe("true");
+    expect(harness.outputs.get("error-count")).toBe(String(result?.summary.errorCount));
+    expect(harness.outputs.get("warning-count")).toBe(String(result?.summary.warnCount));
+    expect(harness.outputs.get("info-count")).toBe(String(result?.summary.infoCount));
+    expect(harness.outputs.get("waived-count")).toBe("0");
+    expect(harness.outputs.get("expected-file-count")).toBe("1");
+    expect(harness.outputs.get("analyzed-file-count")).toBe("1");
     expect(harness.outputs.get("risk-score")).toBe(String(result?.riskScore));
-    expect(harness.outputs.get("report-json")).toBe("agent-gate-report.json");
-    expect(harness.outputs.get("report-markdown")).toBe("agent-gate-report.md");
-    expect(JSON.parse(harness.writtenFiles.get("agent-gate-report.json") ?? "{}")).toMatchObject({
+    expect(harness.outputs.get("report-json")).toBe("mergewarden-report.json");
+    expect(harness.outputs.get("report-markdown")).toBe("mergewarden-report.md");
+    const jsonReport = JSON.parse(harness.writtenFiles.get("mergewarden-report.json") ?? "{}");
+
+    expect(jsonReport).toMatchObject({
       decision: "block",
       metadata: {
-        version: AGENT_GATE_VERSION,
+        configSource: "base-branch",
+        version: MERGEWARDEN_VERSION,
       },
     });
-    expect(harness.writtenFiles.get("agent-gate-report.md")).toContain(
+    expect(jsonReport.findings[0].findingId).toMatch(/^agf_[0-9a-f]{16}$/);
+    expect(harness.writtenFiles.get("mergewarden-report.md")).toContain(
       "workflow/permission-escalation",
     );
-    expect(harness.summaryText()).toContain("# Agent Gate: BLOCKED");
-    expect(harness.infos.join("\n")).toContain("Agent Gate: BLOCKED");
+    expect(harness.summaryText()).toContain("# MergeWarden: BLOCKED");
+    expect(harness.infos.join("\n")).toContain("MergeWarden: BLOCKED");
     expect(harness.infos.join("\n")).toContain("Decision: block");
-    expect(harness.infos.join("\n")).toContain("Risk score:");
+    expect(harness.infos.join("\n")).not.toContain("Risk score:");
     expect(harness.infos.join("\n")).toContain("Findings:");
-    expect(harness.infos.join("\n")).toContain(
-      "- error workflow/permission-escalation .github/workflows/release.yml",
+    expect(harness.infos.join("\n")).toMatch(
+      /- error agf_[0-9a-f]{16} workflow\/permission-escalation \.github\/workflows\/release\.yml/,
     );
-    expect(harness.failures).toEqual(["Agent Gate blocked this pull request."]);
+    expect(harness.failures).toEqual(["MergeWarden blocked this pull request."]);
     expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
       expect.objectContaining({
-        path: "agent-gate.yml",
+        path: "mergewarden.yml",
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         ref: BASE_SHA,
       }),
     );
   });
 
-  it("fetches renamed file base content from previousPath and head content from current path", async () => {
+  it("uses built-in defaults when base-branch config is missing", async () => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      contents: {
+        [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: read\n",
+        [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: write\n",
+      },
+      errors: {
+        [`${BASE_SHA}:mergewarden.yml`]: githubApiError(404, "Not Found"),
+      },
+    });
+    const harness = createHarness({ octokit });
+
+    const result = await runAction(harness.runtime);
+    const jsonReport = JSON.parse(harness.writtenFiles.get("mergewarden-report.json") ?? "{}");
+
+    expect(result?.metadata.configSource).toBe("default");
+    expect(result?.decision).toBe("warn");
+    expect(result?.findings.map((finding) => finding.ruleId)).toContain(
+      "workflow/permission-escalation",
+    );
+    expect(jsonReport.metadata.configSource).toBe("default");
+    expect(harness.outputs.get("decision")).toBe("warn");
+    expect(harness.summaryText()).toContain("# MergeWarden: NEEDS REVIEW");
+    expect(harness.summaryText()).toContain("- Policy source: built-in default");
+    expect(harness.failures).toEqual([]);
+    expect(harness.warnings).toEqual([
+      "MergeWarden could not load mergewarden.yml from the base branch; using built-in default policy.",
+    ]);
+  });
+
+  it("applies mode overrides when using built-in defaults", async () => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      contents: {
+        [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: read\n",
+        [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: write\n",
+      },
+      errors: {
+        [`${BASE_SHA}:mergewarden.yml`]: githubApiError(404, "Not Found"),
+      },
+    });
+    const harness = createHarness({
+      octokit,
+      inputs: {
+        mode: "observe",
+      },
+    });
+
+    const result = await runAction(harness.runtime);
+
+    expect(result?.metadata.configSource).toBe("default");
+    expect(result?.decision).toBe("pass");
+    expect(result?.findings.map((finding) => finding.ruleId)).toContain(
+      "workflow/permission-escalation",
+    );
+    expect(harness.outputs.get("decision")).toBe("pass");
+    expect(harness.failures).toEqual([]);
+    expect(harness.warnings).toEqual([
+      "MergeWarden could not load mergewarden.yml from the base branch; using built-in default policy.",
+    ]);
+  });
+
+  it.each([
+    [403, "Forbidden"],
+    [429, "Rate limit exceeded"],
+    [500, "Internal Server Error"],
+  ])("fails fast for config fetch status %s", async (status, message) => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      errors: {
+        [`${BASE_SHA}:mergewarden.yml`]: githubApiError(status, message),
+      },
+    });
+    const harness = createHarness({ octokit });
+
+    await runAction(harness.runtime);
+
+    expect(harness.failures[0]).toContain(message);
+    expect(harness.outputs.size).toBe(0);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it("fails fast for config fetch exceptions without a GitHub status", async () => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      errors: {
+        [`${BASE_SHA}:mergewarden.yml`]: new Error("network unavailable"),
+      },
+    });
+    const harness = createHarness({ octokit });
+
+    await runAction(harness.runtime);
+
+    expect(harness.failures[0]).toContain("network unavailable");
+    expect(harness.outputs.size).toBe(0);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it("fails fast when an explicit custom config path is missing", async () => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      errors: {
+        [`${BASE_SHA}:.github/agent-gtae.yml`]: githubApiError(404, "Not Found"),
+      },
+    });
+    const harness = createHarness({
+      octokit,
+      inputs: {
+        config: ".github/agent-gtae.yml",
+      },
+    });
+
+    await runAction(harness.runtime);
+
+    expect(harness.failures).toEqual([
+      `Unable to load .github/agent-gtae.yml from base ref ${BASE_SHA}: config file was not found.`,
+    ]);
+    expect(harness.outputs.size).toBe(0);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it.each([
+    ["directory response", []],
+    ["non-file response", { type: "dir" }],
+    ["non-base64 file response", { type: "file", encoding: "utf-8", content: "version: 1\n" }],
+  ])("fails fast for malformed config content: %s", async (_name, data) => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      rawContents: {
+        [`${BASE_SHA}:mergewarden.yml`]: data,
+      },
+    });
+    const harness = createHarness({ octokit });
+
+    await runAction(harness.runtime);
+
+    expect(harness.failures[0]).toContain("response was not base64 file content");
+    expect(harness.outputs.size).toBe(0);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it("fails fast for invalid base-branch config instead of falling back", async () => {
+    const octokit = createOctokit({
+      files: [workflowFile()],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 2\n",
+      },
+    });
+    const harness = createHarness({ octokit });
+
+    await runAction(harness.runtime);
+
+    expect(harness.failures[0]).toMatch(/Invalid mergewarden\.yml: version/);
+    expect(harness.outputs.size).toBe(0);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it("does not fetch content for renamed files outside configured analysis paths", async () => {
     const octokit = createOctokit({
       files: [
         workflowFile({
@@ -330,27 +557,27 @@ describe("runAction", () => {
         }),
       ],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:src/old.ts`]: "export const before = true;\n",
         [`${HEAD_SHA}:src/new.ts`]: "export const after = true;\n",
       },
     });
-    const harness = createHarness({ context: prContext({ body: "" }), octokit });
+    const harness = createHarness({ context: humanPrContext({ body: "" }), octokit });
 
     await runAction(harness.runtime);
 
-    expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
+    expect(octokit.rest.repos.getContent).not.toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         path: "src/old.ts",
         ref: BASE_SHA,
       }),
     );
-    expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
+    expect(octokit.rest.repos.getContent).not.toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         path: "src/new.ts",
         ref: HEAD_SHA,
       }),
@@ -362,7 +589,7 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: read\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: write\n",
       },
@@ -374,8 +601,8 @@ describe("runAction", () => {
           ref: "fork/workflow",
           sha: HEAD_SHA,
           repo: {
-            full_name: "fork-owner/Agent-Gate",
-            name: "Agent-Gate",
+            full_name: "fork-owner/mergewarden",
+            name: "mergewarden",
             owner: {
               login: "fork-owner",
             },
@@ -391,21 +618,21 @@ describe("runAction", () => {
     expect(octokit.rest.pulls.listFiles).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
       }),
     );
     expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
-        path: "agent-gate.yml",
+        repo: "mergewarden",
+        path: "mergewarden.yml",
         ref: BASE_SHA,
       }),
     );
     expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         path: ".github/workflows/release.yml",
         ref: BASE_SHA,
       }),
@@ -413,7 +640,7 @@ describe("runAction", () => {
     expect(octokit.rest.repos.getContent).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "fork-owner",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         path: ".github/workflows/release.yml",
         ref: HEAD_SHA,
       }),
@@ -434,12 +661,15 @@ describe("runAction", () => {
         }),
       ],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:src/deleted.ts`]: "export const before = true;\n",
         [`${HEAD_SHA}:src/added.ts`]: "export const after = true;\n",
       },
     });
-    const harness = createHarness({ context: prContext({ body: "" }), octokit });
+    const harness = createHarness({
+      context: humanPrContext({ body: "", changed_files: 2 }),
+      octokit,
+    });
 
     await runAction(harness.runtime);
 
@@ -454,14 +684,14 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [workflowFile({ filename: "src/app.ts" })],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${HEAD_SHA}:src/app.ts`]: "export const after = true;\n",
       },
       errors: {
         [`${BASE_SHA}:src/app.ts`]: new Error("not found"),
       },
     });
-    const harness = createHarness({ context: prContext({ body: "" }), octokit });
+    const harness = createHarness({ context: humanPrContext({ body: "" }), octokit });
 
     await runAction(harness.runtime);
 
@@ -473,11 +703,11 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions:\n  contents: write\n",
       },
       errors: {
-        [`${BASE_SHA}:.github/workflows/release.yml`]: new Error("not found"),
+        [`${BASE_SHA}:.github/workflows/release.yml`]: githubApiError(404, "Not Found"),
       },
     });
     const harness = createHarness({ octokit });
@@ -491,13 +721,62 @@ describe("runAction", () => {
       "workflow/permission-escalation",
     );
     expect(harness.outputs.get("decision")).toBe("block");
+    expect(harness.outputs.get("status")).toBe("incomplete");
+    expect(harness.outputs.get("analysis-complete")).toBe("false");
+    expect(harness.failures).toEqual(["MergeWarden analysis is incomplete."]);
+  });
+
+  it("loads changed_files with one pull GET when the webhook payload omits it", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+    });
+    const harness = createHarness({ context: prContext({ changed_files: undefined }), octokit });
+
+    await runAction(harness.runtime);
+
+    expect(octokit.rest.pulls.get).toHaveBeenCalledOnce();
+    expect(octokit.rest.pulls.get).toHaveBeenCalledWith(
+      expect.objectContaining({ request: { signal: expect.any(AbortSignal) } }),
+    );
+    expect(harness.outputs.get("analysis-complete")).toBe("true");
+    expect(harness.failures).toEqual([]);
+  });
+
+  it("fails incomplete file-list analysis even when fail-on-block is false", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: observe\n",
+      },
+    });
+    const harness = createHarness({
+      context: prContext({ changed_files: 3_001 }),
+      octokit,
+      inputs: { "fail-on-block": "false" },
+    });
+
+    const result = await runAction(harness.runtime);
+
+    expect(result?.findings.map((finding) => finding.ruleId)).toEqual([
+      "analysis/file-list-incomplete",
+    ]);
+    expect(result?.decision).toBe("block");
+    expect(result?.status).toBe("incomplete");
+    expect(octokit.rest.pulls.listFiles).not.toHaveBeenCalled();
+    expect(harness.outputs.get("analysis-complete")).toBe("false");
+    expect(harness.outputs.get("expected-file-count")).toBe("3001");
+    expect(harness.outputs.get("analyzed-file-count")).toBe("0");
+    expect(harness.failures).toEqual(["MergeWarden analysis is incomplete."]);
   });
 
   it("does not fail block decisions when fail-on-block is false", async () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions: {}\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions: write-all\n",
       },
@@ -519,7 +798,7 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions: {}\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions: write-all\n",
       },
@@ -541,7 +820,7 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
     });
     const harness = createHarness({ octokit });
@@ -553,11 +832,83 @@ describe("runAction", () => {
     expect(octokit.rest.issues?.updateComment).not.toHaveBeenCalled();
   });
 
+  it("stays silent in auto mode when nothing needs attention", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+      comments: [{ id: 3, body: "unrelated" }],
+    });
+    const harness = createHarness({ octokit, inputs: { comment: "auto" } });
+
+    const result = await runAction(harness.runtime);
+
+    // The findings are info only, so they are recorded in the job summary and nowhere else.
+    expect(result?.decision).toBe("pass");
+    expect(octokit.rest.issues?.createComment).not.toHaveBeenCalled();
+    expect(octokit.rest.issues?.updateComment).not.toHaveBeenCalled();
+  });
+
+  it("comments in auto mode when a finding needs attention", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]:
+          "version: 1\nmode: block\ncontract:\n  missing_severity: warn\n",
+      },
+    });
+    const harness = createHarness({
+      octokit,
+      inputs: { comment: "auto" },
+      context: prContext({ body: "Bumps the parser. No contract block here.", changed_files: 0 }),
+    });
+
+    const result = await runAction(harness.runtime);
+
+    expect(result?.summary.warnCount).toBeGreaterThan(0);
+    expect(octokit.rest.issues?.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_number: 5,
+        body: expect.stringContaining("<!-- mergewarden-report -->"),
+      }),
+    );
+  });
+
+  it("updates an existing comment in auto mode once the findings are resolved", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+      comments: [
+        {
+          id: 11,
+          body: "<!-- mergewarden-report -->\n# MergeWarden: NEEDS REVIEW",
+          user: { login: "github-actions[bot]", type: "Bot" },
+        },
+      ],
+    });
+    const harness = createHarness({ octokit, inputs: { comment: "auto" } });
+
+    await runAction(harness.runtime);
+
+    // A stale "NEEDS REVIEW" is worse than no comment at all, so auto still resolves one it
+    // already posted rather than deleting it or leaving it behind.
+    expect(octokit.rest.issues?.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 11,
+        body: expect.stringContaining("# MergeWarden: PASSED"),
+      }),
+    );
+    expect(octokit.rest.issues?.createComment).not.toHaveBeenCalled();
+  });
+
   it("creates a marked PR comment when comment is true and none exists", async () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       comments: [{ id: 3, body: "unrelated" }],
     });
@@ -573,10 +924,10 @@ describe("runAction", () => {
     expect(octokit.rest.issues?.createComment).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         issue_number: 5,
         body: expect.stringContaining(
-          "<!-- agent-gate-report -->\n<!-- This comment is managed by Agent Gate. Do not edit manually. -->\n\n# Agent Gate: PASSED",
+          "<!-- mergewarden-report -->\n<!-- This comment is managed by MergeWarden. Do not edit manually. -->\n\n# MergeWarden: PASSED",
         ),
       }),
     );
@@ -587,18 +938,18 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       comments: [
         {
           id: 8,
-          body: "<!-- agent-gate-report -->\nold",
+          body: "<!-- mergewarden-report -->\nold",
           user: { login: "github-actions[bot]", type: "Bot" },
         },
         { id: 3, body: "unrelated" },
         {
           id: 21,
-          body: "<!-- agent-gate-report -->\nnewer old",
+          body: "<!-- mergewarden-report -->\nnewer old",
           user: { login: "github-actions[bot]", type: "Bot" },
         },
       ],
@@ -615,26 +966,95 @@ describe("runAction", () => {
     expect(octokit.rest.issues?.updateComment).toHaveBeenCalledWith(
       expect.objectContaining({
         owner: "sjh9714",
-        repo: "Agent-Gate",
+        repo: "mergewarden",
         comment_id: 21,
         body: expect.stringContaining(
-          "<!-- agent-gate-report -->\n<!-- This comment is managed by Agent Gate. Do not edit manually. -->\n\n# Agent Gate: PASSED",
+          "<!-- mergewarden-report -->\n<!-- This comment is managed by MergeWarden. Do not edit manually. -->\n\n# MergeWarden: PASSED",
         ),
       }),
     );
     expect(octokit.rest.issues?.createComment).not.toHaveBeenCalled();
+    expect(octokit.paginate).not.toHaveBeenCalled();
+    expect(octokit.rest.issues?.listComments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        per_page: 100,
+        page: 1,
+        sort: "created",
+        direction: "desc",
+        request: { signal: expect.any(AbortSignal) },
+      }),
+    );
+    expect(octokit.rest.issues?.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({ request: { signal: expect.any(AbortSignal) } }),
+    );
+  });
+
+  it("bounds managed-comment discovery to the newest 100 comments", async () => {
+    const comments = Array.from({ length: 100 }, (_, index) => ({
+      id: 1_000 - index,
+      body: `unrelated comment ${index}`,
+      user: { login: "octocat", type: "User" },
+    }));
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+      comments,
+    });
+    const harness = createHarness({ octokit, inputs: { comment: "true" } });
+
+    await runAction(harness.runtime);
+
+    expect(octokit.rest.issues?.listComments).toHaveBeenCalledOnce();
+    expect(octokit.paginate).not.toHaveBeenCalled();
+    expect(octokit.rest.issues?.createComment).toHaveBeenCalledOnce();
+  });
+
+  it("bounds PR comments and reports the exact number of omitted findings", async () => {
+    const files = Array.from({ length: 75 }, (_, index) => ({
+      filename: `src/generated-${index}.ts`,
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      patch: "",
+    }));
+    const octokit = createOctokit({
+      files,
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+    });
+    const harness = createHarness({
+      context: humanPrContext({ changed_files: files.length }),
+      octokit,
+      inputs: { comment: "true" },
+    });
+
+    const result = await runAction(harness.runtime);
+    const createArgs = vi.mocked(octokit.rest.issues!.createComment!).mock.calls[0]?.[0];
+
+    // 75 out-of-scope errors plus two info findings: triage/oversized-change (75 files is past
+    // the 50-file review threshold) and triage/empty-description (this fixture's body is a
+    // contract block and no prose).
+    expect(result?.metadata.totalFindingCount).toBe(77);
+    expect(Buffer.byteLength(harness.summaryText(), "utf8")).toBeLessThanOrEqual(900_000);
+    expect(createArgs).toBeDefined();
+    expect(Buffer.byteLength(createArgs!.body, "utf8")).toBeLessThanOrEqual(60_000);
+    expect(createArgs!.body).toContain("_27 findings omitted from this surface._");
+    expect(createArgs!.body).toContain("Full report: mergewarden-report.md");
   });
 
   it("ignores human-owned marker comments and creates a managed comment", async () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       comments: [
         {
           id: 99,
-          body: "<!-- agent-gate-report -->\nfake report",
+          body: "<!-- mergewarden-report -->\nfake report",
           user: { login: "alice", type: "User" },
         },
       ],
@@ -651,8 +1071,9 @@ describe("runAction", () => {
     expect(octokit.rest.issues?.createComment).toHaveBeenCalledWith(
       expect.objectContaining({
         body: expect.stringContaining(
-          "<!-- This comment is managed by Agent Gate. Do not edit manually. -->",
+          "<!-- This comment is managed by MergeWarden. Do not edit manually. -->",
         ),
+        request: { signal: expect.any(AbortSignal) },
       }),
     );
     expect(octokit.rest.issues?.updateComment).not.toHaveBeenCalled();
@@ -662,12 +1083,12 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       comments: [
         {
           id: 42,
-          body: "<!-- agent-gate-report -->\nold",
+          body: "<!-- mergewarden-report -->\nold",
           user: { login: "github-actions[bot]", type: "Bot" },
         },
       ],
@@ -689,27 +1110,27 @@ describe("runAction", () => {
     expect(octokit.rest.issues?.createComment).not.toHaveBeenCalled();
   });
 
-  it("updates the newest bot-owned marker when human and bot markers both exist", async () => {
+  it("ignores marker comments from bots other than github-actions[bot]", async () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       comments: [
         {
           id: 100,
-          body: "<!-- agent-gate-report -->\nhuman marker",
+          body: "<!-- mergewarden-report -->\nhuman marker",
           user: { login: "alice", type: "User" },
         },
         {
           id: 12,
-          body: "<!-- agent-gate-report -->\nolder bot marker",
+          body: "<!-- mergewarden-report -->\nolder bot marker",
           user: { login: "github-actions[bot]", type: "Bot" },
         },
         {
           id: 61,
-          body: "<!-- agent-gate-report -->\nnewer bot marker",
-          user: { login: "agent-gate[bot]", type: "Bot" },
+          body: "<!-- mergewarden-report -->\nnewer bot marker",
+          user: { login: "mergewarden[bot]", type: "Bot" },
         },
       ],
     });
@@ -724,17 +1145,40 @@ describe("runAction", () => {
 
     expect(octokit.rest.issues?.updateComment).toHaveBeenCalledWith(
       expect.objectContaining({
-        comment_id: 61,
+        comment_id: 12,
       }),
     );
     expect(octokit.rest.issues?.createComment).not.toHaveBeenCalled();
+  });
+
+  it("ignores github-actions markers performed through another GitHub App", async () => {
+    const octokit = createOctokit({
+      files: [],
+      contents: {
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
+      },
+      comments: [
+        {
+          id: 44,
+          body: "<!-- mergewarden-report -->\nforeign app",
+          user: { login: "github-actions[bot]", type: "Bot" },
+          performed_via_github_app: { slug: "foreign-app" },
+        },
+      ],
+    });
+    const harness = createHarness({ octokit, inputs: { comment: "true" } });
+
+    await runAction(harness.runtime);
+
+    expect(octokit.rest.issues?.updateComment).not.toHaveBeenCalled();
+    expect(octokit.rest.issues?.createComment).toHaveBeenCalledOnce();
   });
 
   it("warns without failing when PR comment upsert fails", async () => {
     const octokit = createOctokit({
       files: [],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
       },
       commentErrors: {
         list: new Error("Resource not accessible by integration"),
@@ -750,7 +1194,7 @@ describe("runAction", () => {
     await runAction(harness.runtime);
 
     expect(harness.warnings).toEqual([
-      "Agent Gate could not upsert PR comment: Resource not accessible by integration",
+      "MergeWarden could not upsert PR comment: Resource not accessible by integration",
     ]);
     expect(harness.failures).toEqual([]);
   });
@@ -759,7 +1203,7 @@ describe("runAction", () => {
     const octokit = createOctokit({
       files: [workflowFile()],
       contents: {
-        [`${BASE_SHA}:agent-gate.yml`]: "version: 1\nmode: block\n",
+        [`${BASE_SHA}:mergewarden.yml`]: "version: 1\nmode: block\n",
         [`${BASE_SHA}:.github/workflows/release.yml`]: "permissions: {}\n",
         [`${HEAD_SHA}:.github/workflows/release.yml`]: "permissions: write-all\n",
       },
@@ -774,7 +1218,7 @@ describe("runAction", () => {
     await runAction(harness.runtime);
 
     expect(octokit.rest.issues?.createComment).toHaveBeenCalled();
-    expect(harness.failures).toEqual(["Agent Gate blocked this pull request."]);
+    expect(harness.failures).toEqual(["MergeWarden blocked this pull request."]);
   });
 
   it("fails clearly for invalid fail-on-block input", async () => {
@@ -801,46 +1245,8 @@ describe("runAction", () => {
     await runAction(harness.runtime);
 
     expect(harness.failures).toEqual([
-      "Invalid boolean input comment: nope. Expected true or false.",
+      "Invalid comment input: nope. Expected auto, always, or never.",
     ]);
-  });
-});
-
-describe("fetchRepositoryTextContent", () => {
-  it("returns null for API failures and non-file content", async () => {
-    const throwingOctokit = createOctokit({
-      files: [],
-      errors: {
-        "main:agent-gate.yml": new Error("not found"),
-      },
-    });
-    const directoryOctokit: OctokitLike = {
-      rest: {
-        repos: {
-          getContent: vi.fn(async () => ({ data: [] })),
-        },
-        pulls: {
-          listFiles: vi.fn(async () => ({ data: [] })),
-        },
-      },
-    };
-
-    await expect(
-      fetchRepositoryTextContent(throwingOctokit, {
-        owner: "sjh9714",
-        repo: "Agent-Gate",
-        path: "agent-gate.yml",
-        ref: "main",
-      }),
-    ).resolves.toBeNull();
-    await expect(
-      fetchRepositoryTextContent(directoryOctokit, {
-        owner: "sjh9714",
-        repo: "Agent-Gate",
-        path: ".github",
-        ref: "main",
-      }),
-    ).resolves.toBeNull();
   });
 });
 
@@ -849,11 +1255,11 @@ describe("writeTextFile", () => {
     const dir = await import("node:os").then(({ tmpdir }) => tmpdir());
     const { mkdtemp, readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
-    const root = await mkdtemp(join(dir, "agent-gate-action-"));
-    const reportPath = join(root, "reports", "agent-gate.md");
+    const root = await mkdtemp(join(dir, "mergewarden-action-"));
+    const reportPath = join(root, "reports", "mergewarden.md");
 
-    await writeTextFile(reportPath, "# Agent Gate Report\n");
+    await writeTextFile(reportPath, "# MergeWarden Report\n");
 
-    await expect(readFile(reportPath, "utf8")).resolves.toBe("# Agent Gate Report\n");
+    await expect(readFile(reportPath, "utf8")).resolves.toBe("# MergeWarden Report\n");
   });
 });

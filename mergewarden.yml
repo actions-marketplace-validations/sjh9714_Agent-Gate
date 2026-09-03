@@ -1,0 +1,65 @@
+version: 1
+mode: warn
+
+agent_detection:
+  labels:
+    - ai
+    - agent
+    - codex
+    - claude
+  branch_patterns:
+    - codex/**
+    - claude/**
+    - cursor/**
+
+contract:
+  required_for:
+    - agent
+
+high_risk_paths:
+  policy:
+    paths:
+      - mergewarden.yml
+    severity: warn
+  core:
+    paths:
+      - packages/core/**
+    require_tests:
+      - packages/core/test/**
+    severity: error
+  action:
+    paths:
+      - action.yml
+      - packages/action/**
+      - packages/github/**
+    require_tests:
+      - packages/action/test/**
+      - packages/github/test/**
+    severity: error
+  workflows:
+    paths:
+      - .github/workflows/**
+      - packages/action/action.yml
+    require_tests:
+      - packages/action/test/**
+    severity: warn
+
+github_actions:
+  checks:
+    permission_escalation: error
+    write_all: error
+    id_token_write: warn
+    pull_request_target_head: error
+    unpinned_action: warn
+    unpinned_reusable_workflow: warn
+    unpinned_container: warn
+    missing_permissions: warn
+    unknown_write_permission: warn
+    added_secret_reference: warn
+    workflow_deleted: warn
+    malformed_workflow: error
+
+agentic_workflows:
+  enabled: true
+  severity: warn
+  privileged_severity: error

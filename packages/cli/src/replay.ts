@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -10,14 +11,16 @@ import {
   type AnalysisInput,
   type AnalysisResult,
   type CheckEvidence,
+  type CommitContext,
+  type Finding,
   type ChangeSet,
   type FileChange,
   type PullRequestContext,
   type RepoContext,
   type ReviewEvidence,
-} from "@agent-gate/core";
+} from "@mergewarden/core";
 
-import { AGENT_GATE_VERSION } from "./version.js";
+import { MERGEWARDEN_VERSION } from "./version.js";
 
 type OutputWriter = (text: string) => void;
 
@@ -30,6 +33,7 @@ interface ReplayFixtureJson {
   repo?: Partial<RepoContext>;
   pr?: Partial<PullRequestContext>;
   files?: FileChange[];
+  commits?: CommitContext[];
   reviews?: ReviewEvidence[];
   checks?: CheckEvidence[];
   now?: string;
@@ -48,9 +52,10 @@ class CliError extends Error {
 }
 
 const FILE_STATUSES = new Set<FileChange["status"]>(["added", "modified", "removed", "renamed"]);
+const TERMINAL_PREVIEW_BYTES = 2_048;
 
 const DEFAULT_REPO: RepoContext = {
-  owner: "agent-gate",
+  owner: "mergewarden",
   repo: "replay-fixture",
   defaultBranch: "main",
   baseRef: "main",
@@ -157,6 +162,22 @@ function validateFileChange(value: unknown, index: number): FileChange {
   };
 }
 
+function validateCommit(value: unknown, index: number): CommitContext {
+  if (!isRecord(value)) {
+    throw new CliError(`fixture.json commits[${index}] must be an object.`);
+  }
+
+  if (typeof value.sha !== "string" || value.sha.length === 0) {
+    throw new CliError(`fixture.json commits[${index}].sha must be a non-empty string.`);
+  }
+
+  if (typeof value.message !== "string") {
+    throw new CliError(`fixture.json commits[${index}].message must be a string.`);
+  }
+
+  return { sha: value.sha, message: value.message };
+}
+
 function parseFixtureJson(text: string, filePath: string): ReplayFixtureJson {
   let parsed: unknown;
 
@@ -174,9 +195,16 @@ function parseFixtureJson(text: string, filePath: string): ReplayFixtureJson {
     throw new CliError(`${filePath} must include a files array.`);
   }
 
+  if (parsed.commits !== undefined && !Array.isArray(parsed.commits)) {
+    throw new CliError(`${filePath} commits must be an array when present.`);
+  }
+
   return {
     ...(parsed as ReplayFixtureJson),
     files: parsed.files.map((file, index) => validateFileChange(file, index)),
+    ...(parsed.commits === undefined
+      ? {}
+      : { commits: parsed.commits.map((commit, index) => validateCommit(commit, index)) }),
   };
 }
 
@@ -198,7 +226,7 @@ async function readOptionalText(filePath: string): Promise<string | undefined> {
 
 export async function loadReplayFixture(fixtureDir: string): Promise<AnalysisInput> {
   const root = resolve(fixtureDir);
-  const configText = await readRequiredText(resolve(root, "agent-gate.yml"));
+  const configText = await readRequiredText(resolve(root, "mergewarden.yml"));
   const fixtureText = await readRequiredText(resolve(root, "fixture.json"));
   const prBody = await readOptionalText(resolve(root, "pr-body.md"));
   const fixture = parseFixtureJson(fixtureText, resolve(root, "fixture.json"));
@@ -217,46 +245,207 @@ export async function loadReplayFixture(fixtureDir: string): Promise<AnalysisInp
     config: parseConfig(configText),
     contract: parseContractFromPrBody(pr.body),
     changes: changesFromFiles(fixture.files ?? []),
+    ...(fixture.commits === undefined ? {} : { commits: fixture.commits }),
     reviews: fixture.reviews ?? [],
     checks: fixture.checks ?? [],
     now: fixture.now ?? new Date(0).toISOString(),
     configSource: "local",
-    version: fixture.version ?? AGENT_GATE_VERSION,
+    version: fixture.version ?? MERGEWARDEN_VERSION,
   };
 }
 
-function decisionLabel(decision: AnalysisResult["decision"]): string {
-  if (decision === "block") {
-    return "BLOCKED";
+function statusLabel(result: AnalysisResult): string {
+  switch (result.status) {
+    case "incomplete":
+      return "ANALYSIS INCOMPLETE";
+    case "blocked":
+      return "BLOCKED";
+    case "needs-review":
+      return "NEEDS REVIEW";
+    case "observed":
+      return "OBSERVED FINDINGS";
+    case "passed":
+      return "PASSED";
+  }
+}
+
+function stripTerminalControls(value: string): string {
+  let output = "";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+
+    if (code === 0x1b) {
+      const introducer = value.charCodeAt(index + 1);
+
+      if (introducer === 0x5b) {
+        index += 2;
+        while (index < value.length) {
+          const sequenceCode = value.charCodeAt(index);
+          if (sequenceCode >= 0x40 && sequenceCode <= 0x7e) {
+            break;
+          }
+          index += 1;
+        }
+      } else if (introducer === 0x5d) {
+        index += 2;
+        while (index < value.length) {
+          const sequenceCode = value.charCodeAt(index);
+          if (sequenceCode === 0x07) {
+            break;
+          }
+          if (sequenceCode === 0x1b && value.charCodeAt(index + 1) === 0x5c) {
+            index += 1;
+            break;
+          }
+          index += 1;
+        }
+      } else if (index + 1 < value.length) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (code === 0x0a) {
+      output += "\\n";
+      continue;
+    }
+    if (code === 0x0d) {
+      output += "\\r";
+      continue;
+    }
+    if (code === 0x09) {
+      output += "\\t";
+      continue;
+    }
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+      continue;
+    }
+
+    output += value[index];
   }
 
-  if (decision === "warn") {
-    return "WARN";
+  return output;
+}
+
+function byteLimitedPrefix(value: string, maxBytes: number): string {
+  let output = "";
+  let bytes = 0;
+
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) {
+      break;
+    }
+    output += character;
+    bytes += characterBytes;
   }
 
-  return "PASSED";
+  return output;
+}
+
+export function safeTerminalValue(value: string): string {
+  const normalized = stripTerminalControls(value.normalize("NFC")).replaceAll("@", "@\u200b");
+
+  if (Buffer.byteLength(normalized, "utf8") <= TERMINAL_PREVIEW_BYTES) {
+    return normalized;
+  }
+
+  const digest = createHash("sha256").update(normalized).digest("hex");
+  return `${byteLimitedPrefix(normalized, TERMINAL_PREVIEW_BYTES)}… [sha256:${digest}]`;
+}
+
+const SEVERITY_RANK = { error: 0, warn: 1, info: 2 } as const;
+
+/**
+ * Findings that explain the rest of the report rather than standing on their own.
+ *
+ * `agent/origin-detected` is only `info`, but it is why a contract was demanded at all —
+ * truncating it away leaves `contract/missing` on screen with nothing to justify it.
+ */
+const CONTEXT_RULE_IDS = new Set(["agent/origin-detected"]);
+
+/**
+ * The terminal surface shows at most `limit` findings. Choose which ones by severity rather
+ * than by position, so a report with more findings than fit never hides its errors behind
+ * warnings that happened to be evaluated first. Ties keep evaluation order, and the chosen
+ * findings are rendered in evaluation order so the surface stays stable and groupable by file.
+ */
+function mostSevereFindings(findings: readonly Finding[], limit: number): Finding[] {
+  if (findings.length <= limit) {
+    return [...findings];
+  }
+
+  return findings
+    .map((finding, index) => ({ finding, index }))
+    .sort((left, right) => {
+      const byContext =
+        Number(CONTEXT_RULE_IDS.has(right.finding.ruleId)) -
+        Number(CONTEXT_RULE_IDS.has(left.finding.ruleId));
+
+      if (byContext !== 0) {
+        return byContext;
+      }
+
+      const bySeverity =
+        SEVERITY_RANK[left.finding.severity] - SEVERITY_RANK[right.finding.severity];
+      return bySeverity === 0 ? left.index - right.index : bySeverity;
+    })
+    .slice(0, limit)
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.finding);
 }
 
 export function renderHumanReport(result: AnalysisResult): string {
-  const lines = [`Agent Gate: ${decisionLabel(result.decision)}`, ""];
+  const lines = [
+    `MergeWarden: ${statusLabel(result)}`,
+    "",
+    `Decision: ${result.decision}`,
+    `Findings: ${result.summary.errorCount} error, ${result.summary.warnCount} warning, ${result.summary.infoCount} info`,
+  ];
 
-  if (result.findings.length === 0) {
-    lines.push("No findings.");
-    return `${lines.join("\n")}\n`;
+  if (result.summary.waivedCount > 0) {
+    lines.push(`Waived: ${result.summary.waivedCount}`);
   }
 
-  for (const finding of result.findings) {
-    lines.push(`${finding.severity.toUpperCase()} ${finding.ruleId}`, finding.message);
+  lines.push(
+    `Analysis: ${result.metadata.analysisComplete ? "complete" : "incomplete"}`,
+    `Files analyzed: ${result.metadata.analyzedFileCount} of ${result.metadata.expectedFileCount}`,
+  );
+
+  lines.push("");
+
+  const visibleFindings = mostSevereFindings(result.findings, 10);
+
+  if (visibleFindings.length === 0) {
+    lines.push("No retained findings.");
+  }
+
+  for (const finding of visibleFindings) {
+    lines.push(
+      `${finding.severity.toUpperCase()} ${safeTerminalValue(finding.ruleId)}`,
+      `Message: ${safeTerminalValue(finding.message)}`,
+    );
 
     if (finding.path) {
-      lines.push(`Path: ${finding.path}`);
+      lines.push(`Path: ${safeTerminalValue(finding.path)}`);
     }
 
     for (const evidence of finding.evidence) {
-      lines.push(`- ${evidence.label}: ${evidence.value}`);
+      lines.push(`- ${safeTerminalValue(evidence.label)}: ${safeTerminalValue(evidence.value)}`);
     }
 
     lines.push("");
+  }
+
+  const omitted =
+    result.metadata.omittedFindingCount + result.findings.length - visibleFindings.length;
+
+  if (omitted > 0) {
+    lines.push(
+      `${omitted} additional finding(s) omitted from this surface. Full retained report: rerun with --format json or --format markdown.`,
+      "",
+    );
   }
 
   return `${lines.join("\n")}\n`;
@@ -266,7 +455,7 @@ function parseReplayOptions(argv: string[]): { fixtureDir: string; options: Repl
   const [command, fixtureDir, ...rest] = argv;
 
   if (command !== "replay" || !fixtureDir) {
-    throw new CliError("Usage: agent-gate replay <fixture-dir> [--format json]");
+    throw new CliError("Usage: mergewarden replay <fixture-dir> [--format json]");
   }
 
   let format: ReplayOptions["format"] = "human";
@@ -286,7 +475,11 @@ function parseReplayOptions(argv: string[]): { fixtureDir: string; options: Repl
   return { fixtureDir, options: { format } };
 }
 
-function exitCodeForResult(result: AnalysisResult): 0 | 1 {
+export function exitCodeForResult(result: AnalysisResult): 0 | 1 | 2 {
+  if (!result.metadata.analysisComplete || result.status === "incomplete") {
+    return 2;
+  }
+
   return result.decision === "block" ? 1 : 0;
 }
 
@@ -305,7 +498,7 @@ export async function runCli(
     return exitCodeForResult(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
-    io.stderr(`Agent Gate CLI error: ${message}\n`);
+    io.stderr(`MergeWarden CLI error: ${safeTerminalValue(message)}\n`);
     return 2;
   }
 }

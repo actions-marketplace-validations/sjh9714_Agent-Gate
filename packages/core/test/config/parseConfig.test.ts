@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_CONFIG, parseConfig } from "../../src/index.js";
+import {
+  MergeWardenConfigSchema,
+  DEFAULT_CONFIG,
+  DEFAULT_GITHUB_ACTION_CHECKS,
+  parseConfig,
+} from "../../src/index.js";
 
 describe("parseConfig", () => {
   it("parses a minimal valid config and applies defaults", () => {
@@ -8,15 +13,30 @@ describe("parseConfig", () => {
 
     expect(config.version).toBe(1);
     expect(config.mode).toBe("warn");
+    // Defaults ship the agent signatures the 2,204-PR study actually observed, so a
+    // zero-config install recognises an agent pull request instead of seeing nothing.
     expect(config.agent_detection).toEqual({
-      authors: [],
+      authors: [
+        "copilot-swe-agent[bot]",
+        "google-labs-jules[bot]",
+        "devin-ai-integration[bot]",
+        "kiro-agent[bot]",
+        "codegen-sh[bot]",
+        "opencode-agent[bot]",
+        "tembo[bot]",
+        "amazon-q-developer[bot]",
+        "mentatbot[bot]",
+        "factory-droid[bot]",
+        "ellipsis-dev[bot]",
+      ],
       labels: [],
-      branch_patterns: [],
-      body_patterns: [],
+      branch_patterns: ["codex/**", "claude/**", "cursor/**", "copilot/**", "devin/**"],
+      body_patterns: ["Generated with [Claude Code]", "Generated with Claude Code"],
     });
     expect(config.contract).toEqual({
       required_for: ["agent"],
       allow_missing_in_observe_mode: true,
+      missing_severity: "info",
     });
   });
 
@@ -81,6 +101,18 @@ github_actions:
   block_pull_request_target_checkout: true
   require_pinned_actions: warn
   severity: error
+
+package_scripts:
+  enabled: true
+  paths:
+    - package.json
+    - "**/package.json"
+  lifecycle_scripts:
+    - preinstall
+    - install
+    - postinstall
+    - prepare
+  severity: warn
 `);
 
     expect(config.mode).toBe("block");
@@ -93,15 +125,137 @@ github_actions:
       require_tests: ["tests/auth/**", "**/*.auth.test.ts"],
       severity: "error",
     });
+    expect(config.package_scripts).toEqual({
+      enabled: true,
+      paths: ["package.json", "**/package.json"],
+      lifecycle_scripts: ["preinstall", "install", "postinstall", "prepare"],
+      severity: "warn",
+    });
   });
 
   it("exposes defaults with the same values as a minimal config parse", () => {
     expect(DEFAULT_CONFIG).toEqual(parseConfig("version: 1\n"));
+    expect(DEFAULT_CONFIG.github_actions.checks).toEqual(DEFAULT_GITHUB_ACTION_CHECKS);
+  });
+
+  it("parses granular workflow checks and fills individual defaults", () => {
+    const config = parseConfig(`
+version: 1
+github_actions:
+  checks:
+    permission_escalation: warn
+    unpinned_action: off
+`);
+
+    expect(config.github_actions.checks).toEqual({
+      ...DEFAULT_GITHUB_ACTION_CHECKS,
+      permission_escalation: "warn",
+      unpinned_action: "off",
+    });
+  });
+
+  it("maps legacy workflow settings onto granular checks", () => {
+    const config = parseConfig(`
+version: 1
+github_actions:
+  block_permission_escalation: false
+  block_pull_request_target_checkout: false
+  require_pinned_actions: error
+  severity: warn
+`);
+
+    expect(config.github_actions.checks).toMatchObject({
+      permission_escalation: "off",
+      write_all: "warn",
+      id_token_write: "warn",
+      pull_request_target_head: "off",
+      unpinned_action: "error",
+      unpinned_reusable_workflow: "error",
+      unpinned_container: "error",
+      malformed_workflow: "warn",
+    });
+  });
+
+  it("rejects any raw mixing of granular and legacy workflow settings", () => {
+    const yaml = `
+version: 1
+github_actions:
+  severity: error
+  checks:
+    write_all: error
+`;
+
+    expect(() => parseConfig(yaml)).toThrow(/cannot be mixed with legacy/);
+    expect(
+      MergeWardenConfigSchema.safeParse({
+        version: 1,
+        github_actions: {
+          severity: "error",
+          checks: { write_all: "error" },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates waivers and agentic workflow extensions", () => {
+    const config = parseConfig(`
+version: 1
+waivers:
+  - finding_id: agf_0123456789abcdef
+    reason: Approved exception
+    expires_at: 2026-09-30T00:00:00Z
+agentic_workflows:
+  enabled: true
+  severity: warn
+  privileged_severity: error
+  additional_actions:
+    - uses: owner/custom-agent-action
+      prompt_inputs: [prompt, instructions]
+`);
+
+    expect(config.waivers).toEqual([
+      {
+        finding_id: "agf_0123456789abcdef",
+        reason: "Approved exception",
+        expires_at: "2026-09-30T00:00:00Z",
+      },
+    ]);
+    expect(config.agentic_workflows.additional_actions).toEqual([
+      {
+        uses: "owner/custom-agent-action",
+        prompt_inputs: ["prompt", "instructions"],
+      },
+    ]);
+  });
+
+  it("rejects duplicate, malformed, and non-RFC3339 waivers", () => {
+    expect(() =>
+      parseConfig(`
+version: 1
+waivers:
+  - finding_id: agf_0123456789abcdef
+    reason: first
+    expires_at: 2026-09-30T00:00:00Z
+  - finding_id: agf_0123456789abcdef
+    reason: second
+    expires_at: 2026-10-30T00:00:00Z
+`),
+    ).toThrow(/duplicate waiver/);
+
+    expect(() =>
+      parseConfig(`
+version: 1
+waivers:
+  - finding_id: not-a-finding
+    reason: invalid id
+    expires_at: tomorrow
+`),
+    ).toThrow(/waivers\.0\.finding_id|waivers\.0\.expires_at/);
   });
 
   it("rejects an invalid mode with a config-prefixed message and issue path", () => {
     expect(() => parseConfig("version: 1\nmode: strict\n")).toThrow(
-      /Invalid agent-gate\.yml: mode/,
+      /Invalid mergewarden\.yml: mode/,
     );
   });
 
@@ -112,11 +266,11 @@ version: 1
 agent_control_plane:
   severity: critical
 `),
-    ).toThrow(/Invalid agent-gate\.yml: agent_control_plane\.severity/);
+    ).toThrow(/Invalid mergewarden\.yml: agent_control_plane\.severity/);
   });
 
   it("rejects invalid versions", () => {
-    expect(() => parseConfig("version: 2\n")).toThrow(/Invalid agent-gate\.yml: version/);
+    expect(() => parseConfig("version: 2\n")).toThrow(/Invalid mergewarden\.yml: version/);
   });
 
   it("parses high risk path records by area name", () => {
@@ -140,7 +294,7 @@ high_risk_paths:
 
   it("rejects unknown fields instead of stripping them", () => {
     expect(() => parseConfig("version: 1\nunexpected: true\n")).toThrow(
-      /Invalid agent-gate\.yml: unexpected/,
+      /Invalid mergewarden\.yml: unexpected/,
     );
   });
 
@@ -154,12 +308,28 @@ high_risk_paths:
       "**/AGENTS.override.md",
       "CLAUDE.md",
       "**/CLAUDE.md",
+      "GEMINI.md",
+      "**/GEMINI.md",
+      "QWEN.md",
+      "**/QWEN.md",
       ".cursor/**",
+      ".gemini/**",
       ".github/copilot-instructions.md",
       ".mcp.json",
       "claude_desktop_config.json",
       ".codex/**",
     ]);
+  });
+
+  it("defaults package lifecycle script checks to warning mode", () => {
+    const config = parseConfig("version: 1\n");
+
+    expect(config.package_scripts).toEqual({
+      enabled: true,
+      paths: ["package.json", "**/package.json"],
+      lifecycle_scripts: ["preinstall", "install", "postinstall", "prepare"],
+      severity: "warn",
+    });
   });
 
   it("rejects empty high-risk path patterns", () => {
@@ -171,7 +341,7 @@ high_risk_paths:
     paths:
       - ""
 `),
-    ).toThrow(/Invalid agent-gate\.yml: high_risk_paths\.auth\.paths\.0/);
+    ).toThrow(/Invalid mergewarden\.yml: high_risk_paths\.auth\.paths\.0/);
   });
 
   it("rejects whitespace-only agent detection labels", () => {
@@ -182,7 +352,7 @@ agent_detection:
   labels:
     - "   "
 `),
-    ).toThrow(/Invalid agent-gate\.yml: agent_detection\.labels\.0/);
+    ).toThrow(/Invalid mergewarden\.yml: agent_detection\.labels\.0/);
   });
 
   it("rejects planned config fields that are not implemented yet", () => {
@@ -192,7 +362,7 @@ version: 1
 risk_budget:
   max_files_changed_for_agent: 12
 `),
-    ).toThrow(/Invalid agent-gate\.yml: risk_budget/);
+    ).toThrow(/Invalid mergewarden\.yml: risk_budget/);
 
     expect(() =>
       parseConfig(`
@@ -200,7 +370,7 @@ version: 1
 dependencies:
   require_lockfile_update: true
 `),
-    ).toThrow(/Invalid agent-gate\.yml: dependencies/);
+    ).toThrow(/Invalid mergewarden\.yml: dependencies/);
 
     expect(() =>
       parseConfig(`
@@ -209,7 +379,7 @@ evidence:
   claim_vs_ci:
     enabled: true
 `),
-    ).toThrow(/Invalid agent-gate\.yml: evidence/);
+    ).toThrow(/Invalid mergewarden\.yml: evidence/);
   });
 
   it("rejects planned reviewer, rollback, and file-contract fields", () => {
@@ -220,7 +390,7 @@ contract:
   sources:
     - file
 `),
-    ).toThrow(/Invalid agent-gate\.yml: contract\.sources/);
+    ).toThrow(/Invalid mergewarden\.yml: contract\.sources/);
 
     expect(() =>
       parseConfig(`
@@ -232,7 +402,7 @@ high_risk_paths:
     require_reviewers:
       - "@security-team"
 `),
-    ).toThrow(/Invalid agent-gate\.yml: high_risk_paths\.auth\.require_reviewers/);
+    ).toThrow(/Invalid mergewarden\.yml: high_risk_paths\.auth\.require_reviewers/);
 
     expect(() =>
       parseConfig(`
@@ -243,7 +413,7 @@ high_risk_paths:
       - src/auth/**
     require_rollback_plan: true
 `),
-    ).toThrow(/Invalid agent-gate\.yml: high_risk_paths\.auth\.require_rollback_plan/);
+    ).toThrow(/Invalid mergewarden\.yml: high_risk_paths\.auth\.require_rollback_plan/);
 
     expect(() =>
       parseConfig(`
@@ -252,6 +422,6 @@ agent_control_plane:
   require_reviewers:
     - "@platform-team"
 `),
-    ).toThrow(/Invalid agent-gate\.yml: agent_control_plane\.require_reviewers/);
+    ).toThrow(/Invalid mergewarden\.yml: agent_control_plane\.require_reviewers/);
   });
 });

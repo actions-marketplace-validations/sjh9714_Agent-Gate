@@ -1,20 +1,52 @@
 {
-  "name": "agent-gate",
-  "version": "0.1.6",
-  "private": true,
+  "name": "mergewarden",
+  "version": "0.10.4",
+  "private": false,
   "type": "module",
+  "description": "Rank external GitHub pull requests before code review, then inspect deterministic PR risks.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sjh9714/mergewarden.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/sjh9714/mergewarden#readme",
+  "bugs": {
+    "url": "https://github.com/sjh9714/mergewarden/issues"
+  },
+  "keywords": [
+    "coding-agents",
+    "ai-code-review",
+    "github-actions",
+    "devsecops",
+    "supply-chain-security",
+    "ci-cd"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
-    "agent-gate": "./dist/main.js"
+    "mergewarden": "./dist/main.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "tsup src/main.ts --format esm --dts --sourcemap",
+    "build": "tsup --config tsup.config.ts",
     "test": "vitest run",
+    "test:pack": "pnpm build && node scripts/package-smoke.mjs",
+    "test:packed": "node scripts/package-smoke.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
-  "dependencies": {
-    "@agent-gate/core": "workspace:*"
+  "devDependencies": {
+    "@mergewarden/core": "workspace:*",
+    "@mergewarden/github": "workspace:*"
   }
 }

@@ -1,19 +1,22 @@
 import {
   DEFAULT_CONFIG,
-  type AgentGateConfig,
+  type MergeWardenConfig,
   type AnalysisInput,
   type ChangeSet,
+  type CommitContext,
   type FileChange,
   type ParseContractResult,
   type PullRequestContext,
 } from "../src/index.js";
 
 interface CreateAnalysisInputOptions {
-  config?: AgentGateConfig;
+  config?: MergeWardenConfig;
   contract?: ParseContractResult;
   pr?: Partial<PullRequestContext>;
   files?: FileChange[];
   changes?: ChangeSet;
+  commits?: CommitContext[];
+  repoDocs?: AnalysisInput["repoDocs"];
 }
 
 function changesFromFiles(files: FileChange[]): ChangeSet {
@@ -41,21 +44,23 @@ export function createAnalysisInput(options: CreateAnalysisInputOptions = {}): A
 
   return {
     repo: {
-      owner: "agent-gate",
+      owner: "mergewarden",
       repo: "demo",
       defaultBranch: "main",
       baseRef: "main",
       baseSha: "base-sha",
-      headRef: "codex/task-1-scaffold",
+      headRef: "feature/scaffold",
       headSha: "head-sha",
     },
     pr: {
       number: 42,
-      title: "Scaffold Agent Gate",
-      body: "",
-      author: "codex",
+      title: "Scaffold MergeWarden",
+      // Long enough to clear the triage description threshold. An empty body is a real signal,
+      // so a fixture that leaves it empty is asserting something it does not mean to.
+      body: "Scaffolds the analyzer entry point, wires the default policy through it, and covers the new path with a unit test.",
+      author: "octocat",
       labels: [],
-      branchName: "codex/task-1-scaffold",
+      branchName: "feature/scaffold",
       isFork: false,
       draft: false,
       ...options.pr,
@@ -63,6 +68,8 @@ export function createAnalysisInput(options: CreateAnalysisInputOptions = {}): A
     config: options.config ?? DEFAULT_CONFIG,
     contract: options.contract ?? { kind: "missing" },
     changes: options.changes ?? changesFromFiles(files),
+    ...(options.commits === undefined ? {} : { commits: options.commits }),
+    ...(options.repoDocs === undefined ? {} : { repoDocs: options.repoDocs }),
     reviews: [],
     checks: [],
     now: "2026-06-13T00:00:00.000Z",

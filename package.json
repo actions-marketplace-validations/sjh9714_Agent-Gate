@@ -1,6 +1,6 @@
 {
-  "name": "agent-gate-repo",
-  "version": "0.1.6",
+  "name": "mergewarden-repo",
+  "version": "0.10.4",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.5.0",
@@ -21,6 +21,7 @@
     "eslint": "^9.39.1",
     "globals": "^16.5.0",
     "prettier": "^3.7.4",
+    "puppeteer-core": "^25.5.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.46.4",

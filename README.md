@@ -1,309 +1,152 @@
-# Agent Gate
+# MergeWarden
 
-[![Release](https://img.shields.io/github/v/release/sjh9714/Agent-Gate?include_prereleases&label=release)](https://github.com/sjh9714/Agent-Gate/releases/tag/v0.1.6)
-[![CI](https://github.com/sjh9714/Agent-Gate/actions/workflows/ci.yml/badge.svg)](https://github.com/sjh9714/Agent-Gate/actions/workflows/ci.yml)
-[![Agent Gate](https://github.com/sjh9714/Agent-Gate/actions/workflows/agent-gate.yml/badge.svg)](https://github.com/sjh9714/Agent-Gate/actions/workflows/agent-gate.yml)
-[![License](https://img.shields.io/github/license/sjh9714/Agent-Gate)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/sjh9714/mergewarden?label=release)](https://github.com/sjh9714/mergewarden/releases)
+[![CI](https://github.com/sjh9714/mergewarden/actions/workflows/ci.yml/badge.svg)](https://github.com/sjh9714/mergewarden/actions/workflows/ci.yml)
+[![MergeWarden](https://github.com/sjh9714/mergewarden/actions/workflows/mergewarden.yml/badge.svg)](https://github.com/sjh9714/mergewarden/actions/workflows/mergewarden.yml)
+[![License](https://img.shields.io/github/license/sjh9714/mergewarden)](LICENSE)
 
-No AI PR gets merged without proof.
+See which pull requests need context before code review.
 
-Agent Gate is a deterministic CI firewall for AI-generated pull requests. It checks PR contracts, risky paths, agent instruction drift, workflow permissions, and test evidence before merge.
+Paste a public GitHub repository. MergeWarden surfaces missing issue links,
+thin descriptions, skipped templates, and oversized changes. No login. No AI.
 
-The Action uses no checkout of PR code, no runtime LLM calls, no repository script execution, and no policy loaded from an untrusted PR head. The same analyzer also powers local replay fixtures for deterministic demos.
+## Review a public repository
 
-## Status
+[**Open the public review queue**](https://sjh9714.github.io/mergewarden/)
 
-Agent Gate is pre-release. `v0.1.6` is available as a GitHub prerelease and GitHub Marketplace Action. The core analyzer, CLI replay, root GitHub Action, PR comments, self-dogfooding workflow, and CI are implemented. APIs and rule names may change in later releases.
+The [getting started guide](docs/getting-started.md) explains queue states,
+detailed PR results, and the Action install path.
 
-For released installs, prefer `@v0.1.6` or a pinned commit SHA. `@main` tracks ongoing development.
+Paste `owner/repository` or a full GitHub repository URL. The browser reads the
+latest thirty open pull request summaries, removes trusted repository roles,
+base repository branches, and known maintenance automation, then loads details
+for at most ten external pull requests.
 
-See `docs/v0.1.0-release-notes.md`, `docs/release-verification-v0.1.0.md`, `docs/release-verification-v0.1.1.md`, `docs/release-verification-v0.1.2.md`, `docs/release-verification-v0.1.3.md`, `docs/release-verification-v0.1.4.md`, `docs/release-verification-v0.1.5.md`, and `docs/release-verification-v0.1.6.md` for release notes and verification.
+Rows are ordered by deterministic facts a maintainer would otherwise check
+before reading code.
 
-Latest external install smoke evidence is recorded for `@v0.1.5` in `docs/external-install-smoke-v0.1.5.md`.
+| Fact             | What it means                                                                 |
+| ---------------- | ----------------------------------------------------------------------------- |
+| No linked issue  | The body has no issue number, issue URL, or closing keyword                   |
+| Thin description | The body has fewer than 80 characters of prose                                |
+| Template unused  | The repository has a visible PR template structure that the body did not keep |
+| Oversized        | The change exceeds 50 files or 1,500 changed lines                            |
 
-See `docs/repository-governance.md` for recommended branch protection and release safety settings.
+First contribution is shown as context and never used as a score. MergeWarden
+does not call a contribution spam, low quality, or AI generated. It never
+closes, labels, scores, or comments on a pull request.
 
-See `docs/launch-announcement-draft.md` for a reusable launch announcement draft.
+The queue uses public metadata and the base branch pull request template. It
+does not fetch changed file contents, execute code, use a backend, or store the
+target.
 
-Feedback on AI-generated PR safety policies is welcome in [#27](https://github.com/sjh9714/Agent-Gate/issues/27).
-
-## What It Catches
-
-- Out-of-contract edits: agent PRs changing files outside their declared scope.
-- Workflow permission escalation: Actions workflows gaining broader write access.
-- Agent control-plane drift (`agent-control-plane/drift`): instruction or tool config changes that affect future agents.
-- Missing test evidence: high-risk source changes without matching test file changes.
-- MCP config drift: `.mcp.json` changes that alter which tools agents can call.
-
-## Agent Gate vs LLM Reviewers
-
-LLM reviewers help with judgment. Agent Gate verifies deterministic merge evidence.
-
-Agent Gate does not try to find every semantic bug or replace code review. It checks policy boundaries that should be explainable and repeatable in CI:
-
-- did the PR stay inside its declared scope?
-- did workflow permissions escalate?
-- did agent control-plane files drift?
-- did high-risk code change without matching test-file evidence?
-- did MCP config changes get surfaced?
-
-Use your LLM reviewer for judgment. Use Agent Gate for deterministic merge evidence.
-
-## Why
-
-AI agents can open pull requests. Tests do not always catch:
-
-- out-of-scope edits
-- workflow permission escalation
-- agent control-plane drift
-- missing test evidence
-- MCP config drift
-
-## Replay Demo
-
-Human-readable output for demos:
+For a larger authenticated queue, use the CLI.
 
 ```bash
-pnpm --filter agent-gate build
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/workflow-permission-escalation
+GH_TOKEN=... npx --yes mergewarden@0.10.4 triage owner/repository
 ```
 
-Example output:
+## Run the detailed PR risk scan
 
-```text
-Agent Gate: BLOCKED
+The same page accepts a full pull request URL or `owner/repository#number`.
+Every queue row links to this detailed scan.
 
-ERROR workflow/permission-escalation
-contents permission increased from read to write.
-Path: .github/workflows/release.yml
+The detailed scan checks four security boundaries.
 
-ERROR workflow/dangerous-pattern
-.github/workflows/release.yml contains a dangerous GitHub Actions workflow pattern.
-Path: .github/workflows/release.yml
-```
+| Check                   | What deserves review                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| Workflow permissions    | A workflow gains write access, uses a dangerous trigger, or depends on a moving Action reference |
+| Agent instructions      | A PR changes `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, or another file that steers coding agents    |
+| Untrusted prompt inputs | Pull request text reaches an agent prompt in a workflow                                          |
+| Install scripts         | A package manifest adds or changes install-time lifecycle code                                   |
 
-Machine-readable JSON report:
+The [configuration reference](docs/configuration.md) lists every deterministic
+rule and severity.
+
+Run the same scan from a terminal without cloning the target repository.
 
 ```bash
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/workflow-permission-escalation --format json
+npx --yes mergewarden@0.10.4 scan https://github.com/owner/repository/pull/123
 ```
 
-Expected result: Agent Gate reports a blocked PR with `workflow/permission-escalation` and `workflow/dangerous-pattern` findings.
+## Add the Action
 
-Additional unsafe-pr-zoo demos:
+The Action automates the detailed PR risk check. It does not order the review
+queue.
 
-- `agent-control-plane-drift`: blocks `AGENTS.md` changes because they can change future agent behavior.
-- `out-of-scope-agent-edit`: blocks a payment webhook edit outside the PR contract's `allowed_paths`.
-- `missing-test-evidence`: blocks an auth logic change without matching auth test changes.
-- `mcp-config-drift`: blocks `.mcp.json` changes because MCP config can change which tools an agent can call.
-
-```bash
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/agent-control-plane-drift
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/out-of-scope-agent-edit
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/missing-test-evidence
-node packages/cli/dist/main.js replay fixtures/unsafe-pr-zoo/mcp-config-drift
-```
-
-## 10-Minute Observe Path
-
-Start in warn mode, learn your repo's risk profile, then turn proven policies into merge gates.
-
-Add a checkout-free pull request workflow:
+Create `.github/workflows/mergewarden.yml`.
 
 ```yaml
-name: Agent Gate
+name: MergeWarden PR Risk Check
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
-  agent-gate:
+  mergewarden:
     runs-on: ubuntu-latest
     steps:
-      - uses: sjh9714/Agent-Gate@v0.1.6
+      - uses: sjh9714/mergewarden@v0.10.4
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          mode: warn
-          fail-on-block: false
+          comment: auto
 ```
 
-Start with a small `agent-gate.yml`:
+`comment: auto` stays quiet when there is nothing actionable and updates one
+comment when a finding needs attention. Existing Action defaults are unchanged.
+
+For an immutable install, pin the release commit.
+
+MergeWarden does not publish or recommend a mutable `v0` tag.
 
 ```yaml
-version: 1
-mode: warn
-
-contract:
-  required_for:
-    - agent
-  allow_missing_in_observe_mode: true
-
-agent_detection:
-  labels:
-    - ai
-    - agent
-    - codex
-  branch_patterns:
-    - "codex/**"
-    - "ai/**"
-
-high_risk_paths:
-  workflows:
-    paths:
-      - ".github/workflows/**"
-    severity: error
+- uses: sjh9714/mergewarden@d63b4fc8c09c540375f039ecd30d2fce56abf31f
 ```
 
-For an AI-generated PR, add a small contract to the PR body:
+## Safety boundaries
 
-```md
-<!-- agent-gate-contract
-version: 1
-agent: codex
-task: update auth session handling
-allowed_paths:
-  - src/auth/**
-  - tests/auth/**
-required_evidence:
-  - matching auth tests changed
--->
-```
+- The web app talks directly to the public GitHub API and has no telemetry.
+- The queue reads metadata and one base branch template. The detailed scan reads
+  only the files required by deterministic rules.
+- No checkout. MergeWarden does not execute pull-request code in the web app or
+  Action.
+- Policy comes from the exact base commit, never the untrusted PR head.
+- Analysis never calls a language model.
+- Incomplete evidence is reported as incomplete and never presented as a pass.
 
-Read the first runs as observation, not proof of semantic correctness:
+Read the [security model](docs/security-model.md) and
+[evidence model](docs/evidence-model.md) for the full trust boundary.
 
-- `PASSED`: safe to observe
-- `WARN`: needs human decision
-- `BLOCKED`: must block once policy is enforced
+## Evidence and advanced interfaces
 
-The Markdown report leads with the human decision before the rule details. Example shape:
+[Does triage help?](docs/study/does-triage-help.md) records the existing queue
+measurement and its main limit. It measured whether rows discriminate, not
+whether maintainers save time. The current web queue remains a product
+experiment until maintainers confirm that value.
 
-```text
-Agent Gate: NEEDS HUMAN DECISION
+The [documentation index](docs/README.md) includes configuration, Action and
+CLI references, coding-tool integrations, reproducible studies, and the
+[MCP server](packages/mcp/README.md).
 
-Why:
-This PR changed `.github/workflows/release.yml` and added `secrets.*` usage.
-
-Recommended next step:
-Review the workflow change before merging.
-
-Policy status:
-Warning today; eligible to become a merge gate after tuning.
-```
-
-## Install
-
-Add Agent Gate to a repository with a pull request workflow. No checkout step is required.
-
-```yaml
-name: Agent Gate
-
-on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - edited
-      - labeled
-      - unlabeled
-      - ready_for_review
-
-permissions:
-  contents: read
-  pull-requests: read
-
-jobs:
-  agent-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: sjh9714/Agent-Gate@v0.1.6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          mode: warn
-          fail-on-block: false
-```
-
-Agent Gate loads policy from the PR base branch and does not execute PR branch code. Start with `mode: warn` and `fail-on-block: false`, tune the findings, then move to `mode: block` when ready.
-
-To let Agent Gate create or update a PR report comment, add `issues: write` to the workflow permissions and set `comment: true`. Keep `contents: read` and `pull-requests: read`; no checkout step is needed. On fork pull requests, GitHub may still provide a read-only token, so comment failures are reported as warnings instead of failing the action.
-
-```yaml
-permissions:
-  contents: read
-  pull-requests: read
-  issues: write
-
-with:
-  comment: true
-```
-
-Create `agent-gate.yml` in the repository root:
-
-```yaml
-version: 1
-mode: warn
-
-contract:
-  required_for:
-    - agent
-  allow_missing_in_observe_mode: true
-
-agent_detection:
-  authors:
-    - github-copilot[bot]
-  labels:
-    - ai
-    - agent
-    - codex
-  branch_patterns:
-    - "codex/**"
-    - "ai/**"
-
-high_risk_paths:
-  workflows:
-    paths:
-      - ".github/workflows/**"
-    severity: error
-```
-
-Teams can add auth, payments, infra, and agent-control-plane paths as their policy matures.
-
-Current `agent-gate.yml` support is intentionally narrow: agent detection,
-PR-body contracts, high-risk paths with matching test-file evidence, agent
-control-plane paths, and GitHub Actions workflow rules. File-based contracts,
-risk budgets, dependency drift, claim-vs-CI evidence, reviewer requirements,
-and rollback-plan requirements are planned areas and are rejected today instead
-of being accepted as no-op settings.
-
-## Packages
-
-- `packages/core`: pure analysis engine, built-in deterministic rules, and JSON/Markdown report renderers.
-- `packages/cli`: `agent-gate replay <fixture-dir>` for deterministic local fixture demos.
-- `packages/action`: Node 24 GitHub Action package that reads pull request data through GitHub APIs and calls the core analyzer.
-
-## Action Package
-
-External users should prefer the root action with `sjh9714/Agent-Gate@<ref>`. The package-local action remains at `packages/action/action.yml` for this repository's own development workflow. Both use REST APIs only: they load `agent-gate.yml` from the PR base ref, read changed-file metadata and file contents from the API, run `@agent-gate/core`, write JSON/Markdown reports, set action outputs, write the job summary, and optionally upsert one marked PR report comment. They do not checkout the pull request or execute repository scripts.
-
-## Self-Dogfooding
-
-Agent Gate runs against this repository's pull requests through `.github/workflows/agent-gate.yml`. The workflow uses `sjh9714/Agent-Gate/packages/action@main`, so pull requests do not execute Action code from their own branches while the action itself is under development. It starts in non-blocking `warn` mode while the project tunes early policy.
-
-## Commands
+## Contributing
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
+pnpm build
 pnpm test
 pnpm typecheck
 pnpm lint
-pnpm build
+pnpm format:check
 ```
 
-## Principle
+Every new rule needs a passing fixture, a failing fixture, and a report
+snapshot. See the [contribution guide](CONTRIBUTING.md).
 
-Agent Gate must not call LLMs at runtime, execute PR-controlled code, or load policy from an untrusted PR head. The core analysis package must remain independent from GitHub APIs.
+[简体中文](README.zh-CN.md)
+
+## License
+
+[MIT](LICENSE)

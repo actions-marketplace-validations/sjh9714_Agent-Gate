@@ -1,12 +1,12 @@
-name: "Agent Gate for AI PRs"
-description: "Deterministic CI firewall for AI-generated pull requests"
-author: "Agent Gate contributors"
+name: "MergeWarden PR Risk Check"
+description: "Paste a GitHub PR and see what deserves human review. Deterministic, no checkout, no LLM."
+author: "MergeWarden contributors"
 
 inputs:
   config:
-    description: "Path to agent-gate.yml on the base branch"
+    description: "Optional path to mergewarden.yml on the base branch; built-in defaults are used when the default path is confirmed missing"
     required: false
-    default: "agent-gate.yml"
+    default: "mergewarden.yml"
   github-token:
     description: "GitHub token used for API-only pull request reads"
     required: false
@@ -15,27 +15,43 @@ inputs:
     description: "Override config mode: observe, warn, or block"
     required: false
   comment:
-    description: "Post or update a PR comment with the report"
+    description: "PR comment mode: auto (only when a finding needs attention), always, or never. Needs pull-requests: write"
     required: false
     default: "false"
   fail-on-block:
-    description: "Exit with code 1 when decision is block"
+    description: "Exit with code 1 for complete block decisions; incomplete analysis always fails"
     required: false
     default: "true"
   report-json:
     description: "Path to write JSON report"
     required: false
-    default: "agent-gate-report.json"
+    default: "mergewarden-report.json"
   report-markdown:
     description: "Path to write Markdown report"
     required: false
-    default: "agent-gate-report.md"
+    default: "mergewarden-report.md"
 
 outputs:
   decision:
     description: "pass, warn, or block"
+  status:
+    description: "passed, observed, needs-review, blocked, or incomplete"
+  analysis-complete:
+    description: "Whether MergeWarden received all evidence required for deterministic analysis"
+  error-count:
+    description: "Number of active error findings"
+  warning-count:
+    description: "Number of active warning findings"
+  info-count:
+    description: "Number of active informational findings"
+  waived-count:
+    description: "Number of findings covered by active base-policy waivers"
+  expected-file-count:
+    description: "Authoritative pull request changed_files count"
+  analyzed-file-count:
+    description: "Number of changed files included in deterministic analysis"
   risk-score:
-    description: "Risk score from 0 to 100"
+    description: "Deprecated compatibility score; use status and finding counts"
   report-json:
     description: "Path to JSON report"
   report-markdown:

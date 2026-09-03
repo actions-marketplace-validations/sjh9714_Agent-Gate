@@ -1,0 +1,120 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Signed release tag to publish"
+        required: true
+        default: "v0.8.0"
+        type: string
+      confirmation:
+        description: "Type PUBLISH to confirm the external release action"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: inputs.confirmation == 'PUBLISH'
+    runs-on: ubuntu-latest
+    environment: npm-release
+
+    steps:
+      - name: Validate release ref
+        shell: bash
+        env:
+          RELEASE_REF: ${{ inputs.ref }}
+        run: |
+          if [[ ! "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release ref must be an exact vMAJOR.MINOR.PATCH tag." >&2
+            exit 1
+          fi
+
+      - name: Checkout signed tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Activate npm with OIDC support
+        run: |
+          npm install --global npm@11.18.0
+          test "$(npm --version)" = "11.18.0"
+
+      - name: Activate pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.0 --activate
+
+      - name: Verify annotated signed tag and package version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.ref }}
+        run: |
+          test "$(git describe --tags --exact-match)" = "$RELEASE_REF"
+          tag_object="$(git rev-parse "$RELEASE_REF^{tag}")"
+          test "$(git cat-file -t "$tag_object")" = "tag"
+
+          if ! git verify-tag "$RELEASE_REF"; then
+            verified="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.verification.verified')"
+            test "$verified" = "true"
+          fi
+
+          test "$(node -p "require('./packages/cli/package.json').name")" = "mergewarden"
+          test "$(node -p "require('./packages/cli/package.json').version")" = "${RELEASE_REF#v}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify release candidate
+        run: |
+          pnpm build
+          git diff --exit-code -- packages/action/dist/index.cjs
+          pnpm test
+          pnpm typecheck
+          pnpm lint
+          pnpm format:check
+          pnpm audit
+
+      - name: Pack release artifacts once
+        shell: bash
+        env:
+          RELEASE_REF: ${{ inputs.ref }}
+        run: |
+          version="${RELEASE_REF#v}"
+          pnpm --filter mergewarden pack --pack-destination "$RUNNER_TEMP"
+          pnpm --filter mergewarden-mcp pack --pack-destination "$RUNNER_TEMP"
+
+          # Resolve each tarball by exact filename. A wildcard on the CLI name also matches
+          # the MCP package's tarball, and `find -print -quit` would then publish whichever
+          # the filesystem happened to return first — under the wrong package name.
+          cli="$RUNNER_TEMP/mergewarden-$version.tgz"
+          mcp="$RUNNER_TEMP/mergewarden-mcp-$version.tgz"
+          test -f "$cli"
+          test -f "$mcp"
+          echo "CLI_TARBALL=$cli" >> "$GITHUB_ENV"
+          echo "MCP_TARBALL=$mcp" >> "$GITHUB_ENV"
+          sha256sum "$cli" "$mcp"
+
+      - name: Smoke-test the exact release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm --filter mergewarden test:packed -- "$CLI_TARBALL"
+
+      - name: Publish the exact tarballs with provenance
+        run: |
+          npm publish "$CLI_TARBALL" --provenance --access public
+          npm publish "$MCP_TARBALL" --provenance --access public

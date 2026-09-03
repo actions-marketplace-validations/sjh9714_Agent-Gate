@@ -20,7 +20,12 @@ function whyText(result: AnalysisResult): string {
 }
 
 function findingLine(finding: Finding): string {
-  const parts = ["-", safeReportValue(finding.severity), safeReportValue(finding.ruleId)];
+  const parts = [
+    "-",
+    safeReportValue(finding.severity),
+    safeReportValue(finding.findingId),
+    safeReportValue(finding.ruleId),
+  ];
 
   if (finding.path) {
     parts.push(safeReportValue(finding.path));
@@ -34,9 +39,9 @@ export function renderPlainTextReportSummary(result: AnalysisResult): string {
   const findings = result.findings.slice(0, MAX_LOG_FINDINGS);
   const omittedFindings = result.findings.length - findings.length;
   const lines = [
-    `Agent Gate: ${humanDecisionLabel(result.decision)}`,
+    `MergeWarden: ${humanDecisionLabel(result)}`,
     `Decision: ${result.decision}`,
-    `Risk score: ${result.riskScore} / 100`,
+    `Status: ${result.status}`,
     `Why: ${whyText(result)}`,
   ];
 
@@ -60,6 +65,10 @@ export function renderPlainTextReportSummary(result: AnalysisResult): string {
 
   if (omittedFindings > 0) {
     lines.push(`... ${omittedFindings} more findings omitted`);
+  }
+
+  if (result.waivedFindings.length > 0) {
+    lines.push(`Waived findings: ${result.waivedFindings.length}`);
   }
 
   return `${lines.join("\n")}\n`;
